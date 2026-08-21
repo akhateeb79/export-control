@@ -1,0 +1,104 @@
+Read AGENTS.md, DEVELOPMENT-PLAN.md, and docs/05-technical-architecture.md before doing anything.
+
+We are building Slice 1 — Schema and Migrations only. No application code in this slice.
+
+ARCHITECTURE CORRECTION (apply before writing any migration):
+PostgreSQL requires the partition key to be part of the primary key on partitioned tables.
+Apply these corrections to the DDL:
+- audit_events: PRIMARY KEY (id, occurred_at) — partitioned by RANGE (occurred_at) monthly
+- vendor_access_log: PRIMARY KEY (id, accessed_at) — partitioned by RANGE (accessed_at) monthly
+All other DDL remains verbatim from docs/05-technical-architecture.md.
+
+MIGRATION ORDER — create files under db/migrations/ in this exact order:
+
+001_extensions.sql
+- Enable pg_trgm
+- Enable uuid-ossp
+
+002_reference_tables.sql
+- countries
+- list_sources
+- lookup_types
+- lookup_values
+
+003_config_tables.sql
+- workflow_states
+- workflow_transitions
+- threshold_definitions
+- plans
+- agents
+- agent_versions
+
+004_tenant_tables.sql
+- tenants
+- users
+- compliance_cases
+- screening_results
+- classification_results
+- assessment_results (must include UNIQUE constraint on (case_id, assessment_type) — no column capable of storing a blended party risk value)
+- licence_condition_evaluations
+- sanctions_entries
+- sanctions_entry_names
+- sanctions_entry_identifiers
+- list_versions
+- eccn_entries
+- eccn_parameters
+
+005_rls_policies.sql
+- Enable RLS on every tenant table
+- FORCE ROW LEVEL SECURITY on every tenant table
+- Policy: using ((current_setting('app.tenant_id'))::uuid = tenant_id)
+- SET LOCAL app.tenant_id inside transactions — never a plain SET
+
+006_audit_tables.sql
+- audit_events: PRIMARY KEY (id, occurred_at), UUIDv7 id, sequence column, hash chain columns, monthly range partitioning
+- vendor_access_log: PRIMARY KEY (id, accessed_at), monthly range partitioning
+- Create partitions for current month and next 3 months
+
+007_triggers.sql
+- Trigger: audit_events rows are append-only — UPDATE and DELETE raise exception
+- Trigger: vendor_access_log rows are append-only
+- Trigger: tenant threshold cannot be set below platform floor
+- Trigger: workflow transitions where is_system_locked = true cannot be modified
+
+008_roles.sql
+- Create platform_readonly role
+- GRANT SELECT only on tenant compliance tables
+- No INSERT, UPDATE, or DELETE grants on any tenant compliance table
+
+SEED DATA — create files under db/seed/ in this order:
+
+seed_001_countries.sql — all countries with ISO codes and embargo/control group flags
+seed_002_list_sources.sql — OFAC SDN, OFAC Consolidated, BIS Entity List, BIS Denied Persons, BIS Unverified List
+seed_003_lookup_types.sql — party types, document types, red flag taxonomy, status codes, agent types
+seed_004_lookup_values.sql — all values for each lookup type
+seed_005_workflow_states.sql — DRAFT, SCREENING, REVIEW_REQUIRED, ESCALATED, APPROVED, BLOCKED, CLOSED
+seed_006_workflow_transitions.sql — all permitted transitions with guard conditions and is_system_locked flags
+seed_007_threshold_definitions.sql — platform floor thresholds for sanctions match levels and confidence bands
+seed_008_plans.sql — Starter, Professional, Enterprise plans with entitlements
+seed_009_agents.sql — all 9 agents registered in the agents table
+seed_010_agent_versions.sql — initial prompts from docs/06-agent-design.md loaded into agent_versions table with status DRAFT
+
+RULES — do not break any of these:
+- Use the DDL from docs/05-technical-architecture.md verbatim except the partition key correction above
+- Every tenant table must have tenant_id UUID NOT NULL with foreign key to tenants
+- Every tenant table must have RLS enabled AND forced
+- UUIDv7 primary keys on audit tables
+- UUID primary keys on all other tenant transactional tables
+- Natural VARCHAR codes for reference and config tables — never sequential integers
+- Foreign keys declared and enforced with ON DELETE RESTRICT by default
+- assessment_results must have UNIQUE(case_id, assessment_type) — structural separation of END_USER, END_USE, RISK
+- No application code in this slice — migrations and seed data only
+- Do not modify docs/ or AGENTS.md
+
+WHEN DONE — provide this report:
+1. List every migration file created with line count
+2. List every seed file created with line count
+3. Confirm pg_trgm and uuid-ossp are enabled
+4. Confirm platform_readonly role exists with correct grants only
+5. Confirm RLS is enabled AND forced on every tenant table — list them
+6. Confirm audit_events has composite PRIMARY KEY (id, occurred_at) with monthly partitions
+7. Confirm vendor_access_log has composite PRIMARY KEY (id, accessed_at) with monthly partitions
+8. Confirm assessment_results has UNIQUE(case_id, assessment_type)
+9. Confirm no application code was written
+10. List any deviations from the architecture document and the reason for each

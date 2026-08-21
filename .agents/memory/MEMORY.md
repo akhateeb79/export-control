@@ -1,0 +1,2 @@
+- [Partitioned audit tables](partitioned-audit-tables.md) — PostgreSQL partition constraints require composite audit keys and explicit RLS on each partition.
+- [Ingestion service privilege](ingestion-service-privilege.md) — cross-tenant re-screening needs deliberate RLS-bypass capability; tenant context alone cannot enumerate affected cases.

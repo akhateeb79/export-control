@@ -1,0 +1,73 @@
+Read AGENTS.md, DEVELOPMENT-PLAN.md, and docs/05-technical-architecture.md 
+section 9 before doing anything.
+
+Slice 1 is complete and verified. We are now building Slice 2 — List Ingestion 
+Pipeline only. No other code changes in this slice.
+
+BUILD: Standalone Node.js ingestion job under jobs/ingest/
+
+SOURCES to ingest (all from list_sources seed table):
+- OFAC SDN List
+- OFAC Consolidated Sanctions List
+- BIS Entity List
+- BIS Denied Persons List
+- BIS Unverified List
+
+INGESTION LOGIC — implement exactly in this order for each source:
+1. Fetch the source file over HTTPS
+2. SHA-256 hash the full payload
+3. Compare hash against the latest list_versions row for this source
+4. If hash unchanged: record the check with timestamp, exit — no further processing
+5. If hash changed:
+   a. Parse the source file per its format
+   b. Normalise all entries into sanctions_entries, sanctions_entry_names, 
+      sanctions_entry_identifiers — identical shape regardless of source
+   c. Diff against current active entries: count added, removed, changed
+   d. In ONE transaction:
+      - Insert new list_versions row with added/removed/changed counts
+      - Supersede the prior list_versions row (set status to SUPERSEDED)
+      - Write all normalised entries
+   e. Trigger re-screening cascade: flag open and recently-approved 
+      compliance_cases involving affected parties for re-screening
+
+FAILURE HANDLING — critical:
+- On fetch failure: keep prior list_versions row ACTIVE, record failure, 
+  set freshness indicator to STALE. Never discard good data.
+- On parse failure: same as fetch failure — prior version stays ACTIVE.
+- On partial failure: transaction rolls back, prior version stays ACTIVE.
+
+NAME NORMALISATION MODULE — write as a shared module at jobs/shared/normalise.js
+This module will also be used by the Python matching service in Slice 3.
+Implement these rules from docs/05-technical-architecture.md section 7.2:
+- Lowercase everything
+- Strip diacritics and accents
+- Remove legal suffixes: LLC, L.L.C., FZE, Ltd, Co., Inc., Corp., GmbH, 
+  S.A., B.V. and all common variants
+- Remove honorifics: Sheikh, Dr., Mr., Mrs., H.E., Prof. and common variants
+- Handle Arabic particles: Al-, El-, Ul-, Abd al-, Abu, Ibn, Bint
+- Preserve original script alongside normalised form
+- Return both original and normalised
+
+RULES:
+- The matching engine must not be able to tell which list a row came from
+- Every source must produce identical sanctions_entries schema
+- Ingestion is a standalone script — no Express routes in this slice
+- No UI code
+- Do not modify docs/ or AGENTS.md
+- Do not modify db/migrations/
+- Use SET LOCAL app.tenant_id inside any transactions — never a plain SET
+- All secrets from environment variables — no hardcoded URLs or credentials
+
+WHEN DONE — provide this report:
+1. List every file created under jobs/ with line count
+2. Confirm the shared normalisation module location and what it exports
+3. Run the ingestion job twice against unchanged source data — show that 
+   the second run creates zero new list_versions rows
+4. Simulate a source fetch failure — show prior version remains ACTIVE 
+   and freshness = STALE
+5. Show the list_versions table after a successful run: 
+   source, version, added, removed, changed, status
+6. Confirm all 5 sources produce identical sanctions_entries columns
+7. Confirm the re-screening cascade is triggered on new list versions
+8. List any deviations from docs/05-technical-architecture.md section 9 
+   and the reason for each
