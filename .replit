@@ -1,6 +1,31 @@
 modules = ["python-base-3.13", "nodejs-24"]
+run = "python3 services/matching/app.py &"
 [nix]
 channel = "stable-25_05"
+packages = ["postgresql", "rapidfuzz-cpp", "taskflow"]
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Matching service"
+
+[[workflows.workflow]]
+name = "Matching service"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python3 services/matching/app.py"
+
+[workflows.workflow.metadata]
+outputType = "console"

@@ -1,0 +1,9 @@
+[project]
+name = "export-control-matching"
+version = "0.1.0"
+description = "Deterministic sanctions-name matching service"
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg[binary]>=3.3.4",
+    "rapidfuzz>=3.14.5",
+]
