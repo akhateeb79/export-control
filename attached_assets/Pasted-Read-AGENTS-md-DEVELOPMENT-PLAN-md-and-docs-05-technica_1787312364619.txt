@@ -1,0 +1,120 @@
+Read AGENTS.md, DEVELOPMENT-PLAN.md, and docs/05-technical-architecture.md 
+section 7 before doing anything.
+
+Slices 1 and 2 are complete and verified. We are now building Slice 3 — 
+Name Matching Service only. No other code changes in this slice.
+
+BUILD: Python microservice under services/matching/
+
+ENTRY POINT: POST /screen on internal port 5001 only.
+This port must never be exposed publicly. Express will proxy to it internally.
+
+INPUT schema:
+{
+  "name": "string — the name to screen",
+  "script": "string — latin or arabic",
+  "country": "string — ISO code, optional"
+}
+
+OUTPUT schema:
+{
+  "candidates": [
+    {
+      "sanctions_entry_id": "uuid",
+      "score": 0.0-100.0,
+      "triggering_variant": "the normalised variant that produced this score",
+      "triggering_algorithm": "token_set_ratio | token_sort_ratio | jaro_winkler",
+      "matched_name": "the name from sanctions_entries that matched",
+      "source_list": "string"
+    }
+  ],
+  "max_score": 0.0-100.0,
+  "screening_duration_ms": integer
+}
+
+FIVE-STAGE PIPELINE — implement in exact order, no deviations:
+
+STAGE 1 — Normalise
+Implement the SAME rules as jobs/shared/normalise.js from Slice 2 in Python.
+Rules must be identical — same suffix list, same honorific list, same particle rules.
+Write as services/matching/normalise.py — a shared module used by stages 2 and 3.
+- Lowercase
+- Strip diacritics and accents (unicodedata.normalize)
+- Remove legal suffixes: LLC, L.L.C., FZE, Ltd, Co., Inc., Corp., GmbH, S.A., B.V.
+  and all common variants
+- Remove honorifics: Sheikh, Dr., Mr., Mrs., H.E., Prof. and common variants
+- Handle Arabic particles: Al-, El-, Ul-, Abd al-, Abu, Ibn, Bint
+- Preserve original alongside normalised
+
+STAGE 2 — Generate variants
+Use the Arabic transliteration table from docs/05-technical-architecture.md section 7.3.
+This is a DETERMINISTIC substitution table — not probabilistic, not ML-based.
+Every known character combination maps to every known Latin equivalent.
+Generate all variants for the input name and all its transliterations.
+Write as services/matching/variants.py
+
+STAGE 3 — Retrieve candidates
+Query PostgreSQL sanctions_entries using pg_trgm trigram similarity.
+Use similarity() function with a floor threshold (configurable, default 0.3).
+This retrieves the candidate set — it does not produce the final score.
+Never return more than 50 candidates to stage 4.
+
+STAGE 4 — Score with rapidfuzz
+For each candidate, score against ALL generated variants using:
+- token_set_ratio
+- token_sort_ratio
+- WRatio (replaces JaroWinkler for better Arabic handling)
+Take the MAXIMUM score across all variants and all algorithms.
+Record which variant and which algorithm produced the maximum.
+
+STAGE 5 — Return
+Return all candidates above the minimum score floor (configurable, default 0.0).
+Sort by score descending.
+Include triggering_variant and triggering_algorithm on every result — 
+these are compliance records, not optional fields.
+
+CRITICAL RULES:
+- Zero model calls anywhere in this service. It is deterministic by design.
+- No model import, no Anthropic API call, no LLM of any kind.
+- The triggering variant must be recorded on every result — not just the score.
+- Normalisation rules must be identical to jobs/shared/normalise.js
+
+CONFIGURATION — all from environment variables:
+MATCHING_SERVICE_PORT=5001
+MATCHING_MIN_SIMILARITY=0.3
+MATCHING_MAX_CANDIDATES=50
+MATCHING_MIN_SCORE=0.0
+DATABASE_URL (shared with the Node API)
+
+TEST FILE — write services/matching/tests/test_screening.py
+Must cover all five name groups exactly as written:
+
+Group 1: Abdul Rahman, Abdulrahman, Abd al-Rahman, Abdel Rahman
+Group 2: Mohammed, Mohammad, Muhammad, Mohamed
+Group 3: Al-Hassan, Alhassan, El Hassan, Hassan
+Group 4: Gulf Trading LLC, Gulf Trading L.L.C., Gulf Trading FZE, Gulf Trading
+Group 5: Abu Dhabi, Abou Dhabi, Abo Dhabi
+
+Every name within each group must score above 80 against every other name 
+in the same group. Test must assert this — not just print scores.
+
+PERFORMANCE TEST — write services/matching/tests/test_performance.py
+Screen 6 parties simultaneously.
+Assert total elapsed time is under 3 seconds.
+
+REPLIT INTEGRATION:
+Add the Python service startup to .replit so it runs alongside the Node API.
+Use: python3 services/matching/app.py &
+Port 5001 must only be accessible from localhost.
+
+WHEN DONE — provide this report:
+1. List every file created under services/matching/ with line count
+2. Run test_screening.py — show pass/fail and scores for all 5 name groups
+3. Run test_performance.py — show elapsed time for 6-party screening
+4. Confirm zero model calls exist anywhere in services/matching/ (show grep result)
+5. Confirm triggering_variant and triggering_algorithm are returned on every result
+6. Confirm normalise.py rules are identical to jobs/shared/normalise.js rules — 
+   list the suffix list, honorific list, and particle rules side by side
+7. Show a sample POST /screen request and response
+8. List any deviations from docs/05-technical-architecture.md section 7 
+   and the reason for each

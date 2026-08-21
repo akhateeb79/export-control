@@ -1,0 +1,102 @@
+Read AGENTS.md, DEVELOPMENT-PLAN.md, and docs/05-technical-architecture.md 
+section 10, plus docs/04-functional-spec.md sections 2, 3 and 5 before 
+doing anything.
+
+Slices 1, 2, and 3 are complete and verified. We are now building Slice 4 — 
+Sanctions Agent and API Foundation. 
+
+BUILD PART 1 — Express API Foundation under api/
+
+MIDDLEWARE CHAIN — implement in this exact order, no deviations:
+1. Rate limiting
+2. Request ID generation (attach to every request and response)
+3. JWT verification (reject expired or invalid tokens)
+4. Tenant resolution (load tenant record from JWT claim)
+5. BEGIN transaction + SET LOCAL app.tenant_id = '<uuid>' 
+   ← SET LOCAL inside the transaction, never a plain SET
+6. Entitlement check (load plan entitlements for this tenant)
+7. Business logic handler
+8. Audit write inside the SAME transaction as step 5
+9. COMMIT transaction
+10. Send response
+
+Steps 5 and 8 are inside ONE transaction. If the audit write fails, 
+the business operation rolls back. An action that was not recorded 
+did not happen.
+
+AUTHENTICATION:
+- POST /api/v1/auth/login
+  Accepts email + password, issues JWT access token (15 min expiry) 
+  and refresh token (7 days expiry)
+  MFA is mandatory for Compliance Officer role and above — 
+  return mfa_required: true on first factor success, issue full token 
+  only after second factor verified
+- POST /api/v1/auth/refresh
+  Accepts refresh token, issues new access token
+- POST /api/v1/auth/mfa/verify
+  Accepts TOTP code, completes authentication
+
+JWT payload must include: tenant_id, user_id, role, plan_id, exp
+Never store compliance data in the JWT.
+
+BUILD PART 2 — Sanctions Screening Agent
+
+AGENT BEHAVIOUR — implement exactly:
+1. Retrieve every party on the case including client-supplied beneficial owners
+2. For each party: call POST http://127.0.0.1:5001/screen with name, script, country
+3. Classify each result against tenant thresholds from threshold_definitions:
+   - score >= SANCTIONS_CONFIRMED threshold → CONFIRMED_HIT
+   - score >= SANCTIONS_POSSIBLE threshold → POSSIBLE_HIT  
+   - score < SANCTIONS_POSSIBLE threshold → CLEAR
+4. Write EVERY result including CLEAR to screening_results and audit_events
+   — inside the same transaction as the business operation
+5. Record list_version_id and list sync date on every screening_results row
+6. If any list version is STALE: halt screening, alert platform ops, 
+   return error to client with stale list details
+
+IMMUTABLE RULE GUARDS — evaluate BEFORE any scoring, in this order:
+Rule 1: If screening_results contains a CONFIRMED_HIT for this case →
+  case status = BLOCKED, return IMMUTABLE_RULE error for any APPROVE 
+  attempt regardless of role. No exceptions. No override path.
+Rule 2: If destination country has embargo_status = COMPREHENSIVE and 
+  no licence record exists → case status = BLOCKED
+Rule 3: If case has no screening_results row → reject APPROVE attempt 
+  with IMMUTABLE_RULE
+Rule 10: Every screening result including CLEAR must be written to 
+  audit_events — if this write fails, the screening rolls back entirely
+
+CASE ENDPOINTS — these five only, no others in this slice:
+- POST /api/v1/cases
+  Create a new case in DRAFT state
+  Validate all mandatory fields against lookups
+  Write case creation to audit_events
+  
+- POST /api/v1/cases/:id/submit
+  Validate case is in DRAFT state
+  Move to SCREENING state
+  Invoke orchestrator (sanctions agent runs, classification queued)
+  Return 202 Accepted with case_id and status
+
+- GET /api/v1/cases/:id
+  Return full case with all screening_results
+  Include list version and sync date on each screening result
+  Include stale warning flag if any list version is STALE
+
+- GET /api/v1/cases
+  Return paginated case list for the authenticated tenant
+  Support filters: status, date range, assigned_to
+
+- POST /api/v1/cases/:id/decision
+  APPROVE or BLOCK decision by Compliance Officer role only
+  Before processing: evaluate all four immutable rule guards
+  If any guard fires: return IMMUTABLE_RULE with the rule number
+  If APPROVE and no screening record: return IMMUTABLE_RULE rule 3
+  If APPROVE and CONFIRMED_HIT exists: return IMMUTABLE_RULE rule 1
+  If approved: rationale is mandatory, write override to audit_events
+  
+TENANT ISOLATION:
+- Every query against a tenant table must execute inside a transaction 
+  with SET LOCAL app.tenant_id already set
+- Never use a plain SET — it persists on the pooled connection after 
+  the request ends and the next request inherits it
+- Test this: run

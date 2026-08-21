@@ -19,6 +19,10 @@ author = "agent"
 task = "workflow.run"
 args = "Matching service"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Sanctions API"
+
 [[workflows.workflow]]
 name = "Matching service"
 author = "agent"
@@ -29,3 +33,19 @@ args = "python3 services/matching/app.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow]]
+name = "Sanctions API"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run api"
+waitForPort = 3000
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[ports]]
+localPort = 3000
+externalPort = 80
