@@ -81,7 +81,23 @@ async function guardPasses(client, transition, caseRecord, context = {}) {
       const result = await client.query(
         `SELECT
            EXISTS (SELECT 1 FROM screening_results WHERE case_id = $1 AND tenant_id = $2) AS screened,
-           EXISTS (SELECT 1 FROM classification_results WHERE case_id = $1 AND tenant_id = $2) AS classified`,
+            EXISTS (SELECT 1 FROM case_products WHERE case_id = $1 AND tenant_id = $2)
+            AND NOT EXISTS (
+              SELECT 1
+                FROM case_products cp
+               WHERE cp.case_id = $1
+                 AND cp.tenant_id = $2
+                 AND NOT EXISTS (
+                   SELECT 1
+                     FROM classification_results cr
+                    WHERE cr.case_id = cp.case_id
+                      AND cr.product_id = cp.product_id
+                      AND cr.tenant_id = cp.tenant_id
+                      AND cr.status IN ('CLASSIFIED', 'EAR99')
+                      AND cr.requires_revalidation = FALSE
+                      AND cr.requires_human_review = FALSE
+                 )
+            ) AS classified`,
         [caseRecord.id, caseRecord.tenant_id]
       );
       return result.rows[0].screened && result.rows[0].classified;

@@ -1,0 +1,182 @@
+Read AGENTS.md, DEVELOPMENT-PLAN.md, docs/05-technical-architecture.md 
+section 8, and docs/06-agent-design.md section 5 before doing anything.
+
+Slices 1 through 4 are complete and verified. We are now building Slice 5 — 
+Knowledge Base and Classification Agent only.
+
+BUILD PART 1 — Load the ECCN Control List
+
+Load the Commerce Control List into eccn_entries and eccn_parameters.
+Structure requirements:
+- Each ECCN entry stores: eccn_code, category, product_group, 
+  control_reasons, full_text, effective_date, list_version
+- Each parameter stores: eccn_code, parameter_name, threshold_value, 
+  threshold_unit, comparison_operator
+- Category must be queryable (0-9)
+- Product group must be queryable (A-E)
+- Parameter thresholds must be comparable numerically
+- Seed with real CCL structure — at minimum categories 0-9 with 
+  representative entries sufficient to test the pipeline
+
+Add a control_list_versions table if not already present:
+- version_id, source, effective_date, loaded_at, status (ACTIVE/SUPERSEDED)
+- Only one version may be ACTIVE at a time
+- Loading a new version supersedes the prior one in one transaction
+
+BUILD PART 2 — Three-Stage Classification Pipeline
+
+STAGE 1 — Attribute Extraction (cheap model)
+- Model: use claude-haiku-4-5 (cheapest, fastest)
+- Prompt: loaded from agent_versions table where agent_type = 'CLASSIFIER_EXTRACTION'
+  and status = 'PUBLISHED' — never from source code
+- Input: product name, technical description, specifications from the case
+- Output must be structured JSON:
+  {
+    "category": "0-9 or null",
+    "product_group": "A-E or null", 
+    "key_parameters": {"param_name": "value"},
+    "country_of_origin": "ISO code or null",
+    "confidence": 0.0-1.0,
+    "insufficient_fields": ["list of missing parameters if any"]
+  }
+- If category cannot be determined with confidence: return null for category
+  A wrong category permanently removes the correct ECCN from consideration
+  Null is the correct answer when uncertain — never guess
+- If critical parameters are missing: return INSUFFICIENT_INFORMATION 
+  with the parameter names listed
+
+STAGE 2 — SQL Candidate Filtering (no model call)
+- Use Stage 1 attributes to filter eccn_entries
+- Filter by category if not null
+- Filter by product_group if not null  
+- Match parameter thresholds numerically where provided
+- Return 5-10 candidates maximum
+- If zero candidates survive: immediately route to human classification
+  Set classification status = NEEDS_HUMAN_REVIEW
+  Never call Stage 3 with an empty or guessed candidate set
+- If category is null from Stage 1: broaden the filter, return top 10 
+  by text similarity, flag confidence as LOW
+
+STAGE 3 — Reasoning (capable model)
+- Model: use claude-sonnet-4-6
+- Prompt: loaded from agent_versions table where agent_type = 'CLASSIFIER_REASONING'
+  and status = 'PUBLISHED' — never from source code
+- Input: full text of the 5-10 candidates ONLY, plus the original 
+  product description — never the full CCL
+- Output must be structured JSON:
+  {
+    "eccn": "code or EAR99 or null",
+    "confidence": 0.0-1.0,
+    "reasoning": "detailed explanation referencing specific parameters",
+    "cited_entry": "the specific CCL entry relied upon",
+    "rejected_candidates": [
+      {"eccn": "code", "reason": "why rejected"}
+    ],
+    "us_content_percentage": null or 0-100,
+    "de_minimis_status": "SUBJECT | NOT_SUBJECT | UNKNOWN",
+    "requires_human_review": true or false
+  }
+- If confidence is below the tenant threshold: flag for human classifier
+  Do not block the case — route to NEEDS_HUMAN_REVIEW
+
+STORE RESULTS in classification_results:
+- eccn_code, confidence, reasoning, cited_entry, agent_version_id, 
+  control_list_version_id, status, requires_human_review
+- agent_version_id: the exact agent_versions row used — never null
+- control_list_version_id: the ACTIVE version at time of classification
+
+CACHE LOGIC:
+- On case submission: check tenant product catalogue for existing 
+  classification of the same product
+- If found AND control_list_version_id matches current ACTIVE version:
+  return cached result immediately, no agent call
+- If found AND control_list_version_id does NOT match current ACTIVE:
+  flag as requires_revalidation = true, run classification again
+- If not found: run the three-stage pipeline, store result in catalogue
+
+CACHE INVALIDATION:
+- When a new control list version becomes ACTIVE:
+  UPDATE all classification_results 
+  SET requires_revalidation = true
+  WHERE control_list_version_id != new_active_version_id
+  This must run inside the same transaction that activates the new version
+
+BUILD PART 3 — API Endpoint
+
+Add to the existing Express API:
+- POST /api/v1/cases/:id/classify
+  Trigger classification for the case
+  Return 202 Accepted — classification runs asynchronously
+  
+- GET /api/v1/cases/:id/classification
+  Return classification result with:
+  - eccn_code, confidence, reasoning, cited_entry
+  - agent_version_id and agent version details
+  - control_list_version_id  
+  - requires_revalidation flag
+  - requires_human_review flag
+  - cached: true/false
+
+SEED AGENT PROMPTS:
+Load into agent_versions table with status = 'PUBLISHED':
+- CLASSIFIER_EXTRACTION prompt from docs/06-agent-design.md
+- CLASSIFIER_REASONING prompt from docs/06-agent-design.md
+Prompts go in the database. They must not appear in any source file.
+Verify with: grep -r "CLASSIFIER" api/src — must return zero prompt text
+
+RULES:
+- No prompt text in any source file — prompts are rows in agent_versions
+- No hardcoded ECCN codes or classification logic in source files
+- No hardcoded threshold values — all from threshold_definitions
+- agent_version_id is never null on a classification result
+- control_list_version_id is never null on a classification result
+- Stage 3 is never called with zero candidates
+- Do not modify docs/ or AGENTS.md
+- Do not modify existing migrations — add new ones only
+
+WHEN DONE — provide this report:
+
+1. List every file created or modified with line count
+
+2. Run these verification tests and show results:
+
+TEST A: Missing parameter
+Submit a product description that is missing a determining parameter
+(e.g. a laser without power output specified)
+Must return INSUFFICIENT_INFORMATION naming the missing parameter
+Must NOT guess or return a low-confidence ECCN
+
+TEST B: Excluded correct entry
+Manually remove the correct ECCN entry from eccn_entries
+Submit the product — must return CANDIDATE_SET_INADEQUATE or 
+route to NEEDS_HUMAN_REVIEW, not return the nearest wrong entry
+
+TEST C: Clearly uncontrolled commodity
+Submit "standard wooden office chair, no electronic components"
+Must return EAR99 with reasoning
+Must NOT return a controlled ECCN
+
+TEST D: Cache invalidation
+Run classification on a product, confirm result is cached
+Insert a new control_list_versions row as ACTIVE
+Query the cached result — must show requires_revalidation = true
+Must not be reusable until confirmed
+
+TEST E: Agent version tracking
+Confirm every classification_results row has:
+- agent_version_id that references a real agent_versions row
+- control_list_version_id that references a real control_list_versions row
+SELECT count(*) FROM classification_results 
+WHERE agent_version_id IS NULL OR control_list_version_id IS NULL
+Must return 0
+
+TEST F: No prompt in source files
+grep -r "CLASSIFIER_EXTRACTION\|CLASSIFIER_REASONING" api/src
+Must return zero prompt text — only references to agent_type constants
+
+3. Show a complete sample classification result JSON
+
+4. Confirm Stage 3 was never called with zero candidates 
+   (show the guard code)
+
+5. List any deviations from the architecture and reason for each

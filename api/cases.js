@@ -2,13 +2,14 @@
 
 const crypto = require('node:crypto');
 const express = require('express');
+const { productFingerprint } = require('./classification');
 const { hasComprehensiveEmbargo, hasLicenceRecord, screenCase } = require('./sanctions');
 const { ApiError, asyncHandler } = require('./errors');
 const { assertSystemTransition, findTransition, guardPasses } = require('./workflow');
 
 const CASE_ROLES = ['INITIATOR', 'REVIEWER', 'COMPLIANCE_OFFICER', 'CLIENT_ADMIN', 'API_CLIENT'];
 
-function caseRouter({ middleware, config }) {
+function caseRouter({ middleware, config, classifier }) {
   const router = express.Router();
   const chain = (roles, agentCode) => [
     middleware.authenticate,
@@ -23,7 +24,15 @@ function caseRouter({ middleware, config }) {
   ];
 
   router.post('/', ...chain(CASE_ROLES), asyncHandler(async (request, response, next) => {
-    const { case_ref: caseRef, destination_country: destinationCountry, stated_end_use: statedEndUse, incoterms, planned_ship_date: plannedShipDate, parties } = request.body || {};
+    const {
+      case_ref: caseRef,
+      destination_country: destinationCountry,
+      stated_end_use: statedEndUse,
+      incoterms,
+      planned_ship_date: plannedShipDate,
+      parties,
+      products = []
+    } = request.body || {};
     if (!caseRef || !destinationCountry || !statedEndUse || !Array.isArray(parties) || !parties.length) {
       throw new ApiError(400, 'VALIDATION_FAILED', { fields: ['case_ref', 'destination_country', 'stated_end_use', 'parties'] });
     }
@@ -37,6 +46,7 @@ function caseRouter({ middleware, config }) {
     const existingParties = await client.query(`SELECT id FROM parties WHERE id = ANY($1::uuid[])`, [partyIds]);
     if (existingParties.rowCount !== partyIds.length) throw new ApiError(400, 'VALIDATION_FAILED', { fields: ['parties'] });
 
+    if (!Array.isArray(products)) throw new ApiError(400, 'VALIDATION_FAILED', { fields: ['products'] });
     const caseId = crypto.randomUUID();
     const retentionYears = response.locals.subscription.retention_years;
     await client.query(
@@ -53,10 +63,108 @@ function caseRouter({ middleware, config }) {
         [crypto.randomUUID(), request.auth.tenant_id, caseId, party.party_id, party.party_role]
       );
     }
-    response.locals.result = { status: 201, body: { case_id: caseId, status: 'DRAFT' } };
+    const productIds = [];
+    for (const product of products) {
+      if (!product?.name || !product?.description) {
+        throw new ApiError(400, 'VALIDATION_FAILED', { fields: ['products.name', 'products.description'] });
+      }
+      const fingerprint = productFingerprint(product);
+      const productId = crypto.randomUUID();
+      const catalogueProduct = await client.query(
+        `INSERT INTO products (
+           id, tenant_id, part_number, name, description, specifications,
+           origin_country, us_content_pct, product_fingerprint
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (tenant_id, product_fingerprint) WHERE product_fingerprint IS NOT NULL
+         DO UPDATE SET name = products.name
+         RETURNING id`,
+        [
+          productId, request.auth.tenant_id, product.part_number || null, product.name, product.description,
+          JSON.stringify(product.specifications || {}), product.origin_country || null,
+          product.us_content_pct ?? null, fingerprint
+        ]
+      );
+      const resolvedProductId = catalogueProduct.rows[0].id;
+      await client.query(
+        `INSERT INTO case_products (id, tenant_id, case_id, product_id, product_snapshot)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [crypto.randomUUID(), request.auth.tenant_id, caseId, resolvedProductId, JSON.stringify({
+          name: product.name,
+          description: product.description,
+          specifications: product.specifications || {},
+          origin_country: product.origin_country || null,
+          us_content_pct: product.us_content_pct ?? null
+        })]
+      );
+      productIds.push(resolvedProductId);
+    }
+    response.locals.result = { status: 201, body: { case_id: caseId, status: 'DRAFT', product_ids: productIds } };
     response.locals.auditEvent = {
       caseId, eventType: 'CASE_CREATED',
-      afterState: { state: 'DRAFT', party_count: parties.length }
+      afterState: { state: 'DRAFT', party_count: parties.length, product_count: productIds.length }
+    };
+    next();
+  }), middleware.finalize);
+
+  router.post('/:id/classify', ...chain(CASE_ROLES, 'CLASSIFIER_EXTRACTION'), asyncHandler(async (request, response, next) => {
+    const client = response.locals.dbClient;
+    const caseResult = await client.query(
+      `SELECT * FROM compliance_cases WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+      [request.params.id, request.auth.tenant_id]
+    );
+    const caseRecord = caseResult.rows[0];
+    if (!caseRecord) throw new ApiError(404, 'NOT_FOUND');
+    if (!['SCREENING', 'REVIEW_REQUIRED', 'ESCALATED'].includes(caseRecord.state)) {
+      throw new ApiError(409, 'VALIDATION_FAILED', { state: caseRecord.state });
+    }
+    const requestProductId = request.body?.product_id || null;
+    const queued = await classifier.enqueue(client, {
+      tenantId: request.auth.tenant_id,
+      caseId: caseRecord.id,
+      requestedBy: request.auth.user_id,
+      productId: requestProductId
+    });
+    const allCached = queued.outcomes.every((outcome) => outcome.cached);
+    response.locals.result = {
+      status: allCached ? 200 : 202,
+      body: {
+        case_id: caseRecord.id,
+        control_list_version_id: queued.controlListVersion.id,
+        cached: allCached,
+        classifications: queued.outcomes
+      }
+    };
+    response.locals.auditEvent = {
+      caseId: caseRecord.id,
+      eventType: 'CLASSIFICATION_REQUESTED',
+      afterState: {
+        control_list_version_id: queued.controlListVersion.id,
+        classifications: queued.outcomes.map((outcome) => ({
+          product_id: outcome.product_id,
+          job_id: outcome.job_id || null,
+          cached: outcome.cached
+        }))
+      }
+    };
+    next();
+  }), middleware.finalize);
+
+  router.get('/:id/classification', ...chain(CASE_ROLES), asyncHandler(async (request, response, next) => {
+    const client = response.locals.dbClient;
+    const caseResult = await client.query(
+      `SELECT id FROM compliance_cases WHERE id = $1 AND tenant_id = $2`,
+      [request.params.id, request.auth.tenant_id]
+    );
+    if (!caseResult.rows[0]) throw new ApiError(404, 'NOT_FOUND');
+    const classifications = await classifier.getCaseResults(client, {
+      tenantId: request.auth.tenant_id,
+      caseId: request.params.id
+    });
+    response.locals.result = { status: 200, body: { case_id: request.params.id, classifications } };
+    response.locals.auditEvent = {
+      caseId: request.params.id,
+      eventType: 'CLASSIFICATION_VIEWED',
+      afterState: { classification_count: classifications.length }
     };
     next();
   }), middleware.finalize);
@@ -101,11 +209,16 @@ function caseRouter({ middleware, config }) {
         ORDER BY sr.screened_at, sr.id`,
       [caseRecord.id, request.auth.tenant_id]
     );
+    const classifications = await classifier.getCaseResults(client, {
+      tenantId: request.auth.tenant_id,
+      caseId: caseRecord.id
+    });
     response.locals.result = {
       status: 200,
       body: {
         case: caseRecord,
         screening_results: screenings.rows,
+        classifications,
         stale_warning: false
       }
     };
@@ -180,10 +293,30 @@ function caseRouter({ middleware, config }) {
         if (!screening.rows[0]) rejection = 'RULE_3';
         else {
           const classification = await client.query(
-            `SELECT 1 FROM classification_results WHERE case_id = $1 AND tenant_id = $2 LIMIT 1`,
+            `SELECT
+               EXISTS (
+                 SELECT 1 FROM case_products
+                  WHERE case_id = $1 AND tenant_id = $2
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM case_products cp
+                  WHERE cp.case_id = $1
+                    AND cp.tenant_id = $2
+                    AND NOT EXISTS (
+                      SELECT 1
+                        FROM classification_results cr
+                       WHERE cr.case_id = cp.case_id
+                         AND cr.product_id = cp.product_id
+                         AND cr.tenant_id = cp.tenant_id
+                         AND cr.status IN ('CLASSIFIED', 'EAR99')
+                         AND cr.requires_revalidation = FALSE
+                         AND cr.requires_human_review = FALSE
+                    )
+               ) AS complete`,
             [caseRecord.id, request.auth.tenant_id]
           );
-          if (!classification.rows[0]) rejection = 'CLASSIFICATION_REQUIRED';
+          if (!classification.rows[0].complete) rejection = 'CLASSIFICATION_REQUIRED';
         }
       }
     }

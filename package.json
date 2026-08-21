@@ -9,7 +9,7 @@
   "scripts": {
     "api": "node api/server.js",
     "ingest": "node jobs/ingest/index.js",
-    "test:api": "node --test api/tests/integration.test.js",
+    "test:api": "node --test api/tests/*.test.js",
     "test:ingest": "node jobs/ingest/test/run-integration.js"
   },
   "repository": {
