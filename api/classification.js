@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const { writeAudit } = require('./audit');
 const { beginTenantTransaction, uuidV7 } = require('./db');
 const { ApiError } = require('./errors');
+const { invokeGroq } = require('../src/agents/providers/groq-provider');
 
 const TERMINAL_STATUSES = new Set([
   'CLASSIFIED',
@@ -144,6 +145,16 @@ async function invokeAnthropic(config, agent, input, modelClient) {
     throw error;
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function invokeClassificationModel(config, agent, input, modelClient) {
+  try {
+    return await invokeAnthropic(config, agent, input, modelClient);
+  } catch (error) {
+    if (error.code !== 'MODEL_PROVIDER_FAILED') throw error;
+    console.warn('SANDBOX PROVIDER ACTIVE — not for production use');
+    return invokeGroq(config, agent, input);
   }
 }
 
@@ -479,7 +490,7 @@ function createClassificationService({ pool, config, modelClient }) {
       let activeInput = extractionInput;
       let extractionRaw;
       try {
-        extractionRaw = await invokeAnthropic(config, extractionAgent, extractionInput, modelClient);
+        extractionRaw = await invokeClassificationModel(config, extractionAgent, extractionInput, modelClient);
         const extraction = normaliseExtraction(extractionRaw);
         await insertAgentRun(client, {
           tenantId: job.tenant_id, resultId, stage: 'EXTRACTION', agentVersionId: extractionAgent.id,
@@ -537,7 +548,7 @@ function createClassificationService({ pool, config, modelClient }) {
         activeStage = 'REASONING';
         activeAgent = reasoningAgent;
         activeInput = reasoningInput;
-        const reasoningRaw = await invokeAnthropic(config, reasoningAgent, reasoningInput, modelClient);
+        const reasoningRaw = await invokeClassificationModel(config, reasoningAgent, reasoningInput, modelClient);
         const reasoning = normaliseReasoning(reasoningRaw, candidates);
         await insertAgentRun(client, {
           tenantId: job.tenant_id, resultId, stage: 'REASONING', agentVersionId: reasoningAgent.id,
