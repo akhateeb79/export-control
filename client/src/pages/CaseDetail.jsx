@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { apiFetch } from '../lib/api';
+import { apiFetch, apiFetchRaw } from '../lib/api';
 import { getSession } from '../lib/auth';
 import RedFlagPanel from '../components/RedFlagPanel';
 import CatchAllPanel from '../components/CatchAllPanel';
@@ -29,6 +29,7 @@ export default function CaseDetail() {
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [cecoUserId, setCecoUserId] = useState(null);
   const [recommendedActions, setRecommendedActions] = useState([]);
+  const [pdfBusy, setPdfBusy] = useState(false);
 
   async function loadCase() {
     try {
@@ -139,6 +140,23 @@ export default function CaseDetail() {
     }
   }
 
+  async function downloadShipmentSummary() {
+    setPdfBusy(true);
+    try {
+      const response = await apiFetchRaw(`/api/v1/reports/shipment-summary/${id}`);
+      if (!response.ok) throw new Error(`Download failed (${response.status})`);
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(await response.blob());
+      link.download = `shipment-summary-${caseRecord.case_ref}.pdf`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (downloadError) {
+      setActionState((previous) => ({ ...previous, error: downloadError.message }));
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
   if (error) return <div className="page"><Link className="text-cyan-200" to="/">← Back to cases</Link><div className="callout callout-danger mt-6">{error}</div></div>;
   if (!payload) return <div className="page"><div className="empty-state">Loading case record…</div></div>;
 
@@ -148,7 +166,7 @@ export default function CaseDetail() {
       <header className="page-header">
          <div><p className="eyebrow">Case dossier / {caseRecord.id}</p><div className="mt-3 flex flex-wrap items-center gap-3"><h1>{caseRecord.case_ref}</h1><StatusBadge status={caseRecord.state} /></div><p className="page-subtitle">Created {formatDate(caseRecord.created_at)} · Destination {caseRecord.destination_country || '—'}</p></div>
          {['COMPLIANCE_OFFICER', 'COMPLIANCE_ADMIN', 'SUPER_ADMIN'].includes(getSession()?.user?.role) && <Link className="button-primary" to={`/cases/${id}/monitor`}>Open live monitor →</Link>}
-        <div className="text-right"><p className="eyebrow">Overall risk</p><p className={`mt-2 text-2xl font-semibold ${caseRecord.overall_risk === 'BLOCKED' ? 'text-rose-300' : 'text-white'}`}>{caseRecord.overall_risk || 'Pending'}</p>{canEdit && <div className="mt-4 flex justify-end gap-2"><button className="button-secondary" onClick={amendCase}>Amend</button><button className="button-quiet" onClick={cloneCase}>Clone</button></div>}</div>
+        <div className="text-right"><p className="eyebrow">Overall risk</p><p className={`mt-2 text-2xl font-semibold ${caseRecord.overall_risk === 'BLOCKED' ? 'text-rose-300' : 'text-white'}`}>{caseRecord.overall_risk || 'Pending'}</p><div className="mt-4 flex justify-end gap-2"><button className="button-quiet" disabled={pdfBusy} onClick={downloadShipmentSummary}>{pdfBusy ? 'Generating…' : 'Shipment summary PDF'}</button>{canEdit && <><button className="button-secondary" onClick={amendCase}>Amend</button><button className="button-quiet" onClick={cloneCase}>Clone</button></>}</div></div>
       </header>
       {sanctionsBlocked && <div className="callout callout-danger mb-6"><strong>Case action locked</strong><span>Confirmed sanctions matches are permanent blocks. No override or approval action is available.</span></div>}
        {caseRecord.state === 'SCREENING_REVIEW' && canDecide && potentialSanctions.length > 0 && <section className="panel mb-6 border-amber-400/30">
