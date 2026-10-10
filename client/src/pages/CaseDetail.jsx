@@ -99,6 +99,10 @@ export default function CaseDetail() {
   const classifications = Array.isArray(payload?.classifications)
     ? payload.classifications
     : payload?.classifications?.results || [];
+  const uaeControlled = classifications.some(
+    (c) => c.uae_control_status === 'UAE_CONTROLLED' || c.uae_control_status === 'UAE_DECLARATION_REQUIRED'
+  );
+  const uaeDeclarationRequired = classifications.some((c) => c.uae_control_status === 'UAE_DECLARATION_REQUIRED');
   const orchestrationStages = [
     ['Sanctions screening', screening.length > 0],
     ['Product classification', classifications.length > 0],
@@ -274,6 +278,14 @@ export default function CaseDetail() {
        <CaseEvaluation evaluation={payload.evaluation} />
        <RecommendedActionsPanel actions={recommendedActions} canEdit={canEdit} onRefresh={loadRecommendedActions} />
       {canEdit && <DocumentUpload caseId={id} onApplied={loadCase} />}
+       {uaeControlled && (
+         <div className={`rounded border px-4 py-3 text-sm ${uaeDeclarationRequired ? 'border-red-700/50 bg-red-950/30 text-red-200' : 'border-orange-700/50 bg-orange-950/30 text-orange-200'}`}>
+           <strong>UAE National Control List — Action Required:</strong>{' '}
+           {uaeDeclarationRequired
+             ? 'One or more products require a UAE export declaration or permit. Do not proceed without verifying UAE licensing.'
+             : 'One or more products appear on the UAE National Control List. Verify UAE licensing requirements before shipment.'}
+         </div>
+       )}
        {canEdit && <RedFlagPanel caseId={id} caseState={caseRecord.state} />}
        {canEdit && <CatchAllPanel caseId={id} initialAssessment={caseRecord.catch_all_assessment} caseRecord={caseRecord} />}
        <div className="grid gap-5"><ScreeningResult results={screening} blocked={sanctionsBlocked} /><ClassificationResult classifications={payload.classifications} /><AssessmentResult assessments={assessments} /><DeterminationResult licence={payload.licence} /></div>

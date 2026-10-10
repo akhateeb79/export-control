@@ -4,7 +4,9 @@ const crypto = require('node:crypto');
 const { writeAudit } = require('./audit');
 const { beginTenantTransaction, uuidV7 } = require('./db');
 const { ApiError } = require('./errors');
-const { invokeGroq } = require('../src/agents/providers/groq-provider');
+const { assertPermittedLanguage } = require('./output-language');
+const { callAIAgent } = require('./services/aiClient');
+const { screenAgainstUaeList } = require('../src/services/uaeControlListService');
 
 const TERMINAL_STATUSES = new Set([
   'CLASSIFIED',
@@ -91,8 +93,7 @@ function normaliseReasoning(output, candidates) {
   }
   const reasoning = String(output.reasoning || '').trim();
   if (!reasoning) throw providerError('MODEL_OUTPUT_INVALID', 'Reasoning explanation is required');
-  const prohibited = /no licence is required|this transaction is compliant|you may proceed|the party is clean/i;
-  if (prohibited.test(reasoning)) throw providerError('MODEL_OUTPUT_INVALID', 'Reasoning includes prohibited determination language');
+  assertPermittedLanguage(reasoning);
   const rejected = Array.isArray(output.rejected_candidates) ? output.rejected_candidates : [];
   const missing = Array.isArray(output.missing_information) ? output.missing_information : [];
   const cited = output.cited_entry ? String(output.cited_entry) : (eccn ? candidates.find((candidate) => candidate.eccn === eccn)?.heading : null);
@@ -107,55 +108,23 @@ function providerError(code, message) {
 
 async function invokeAnthropic(config, agent, input, modelClient) {
   if (modelClient) return modelClient({ agent, input });
-  if (!config.anthropicApiKey) throw providerError('MODEL_PROVIDER_UNAVAILABLE', 'ANTHROPIC_API_KEY is not configured');
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), agent.timeout_seconds * 1000);
+  const response = await callAIAgent({
+    systemPrompt: agent.system_prompt,
+    userPrompt: JSON.stringify(input),
+    maxTokens: agent.max_tokens,
+    model: agent.model_id,
+    timeoutSeconds: agent.timeout_seconds,
+    config
+  });
   try {
-    const response = await fetch(config.anthropicBaseUrl, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': config.anthropicApiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: agent.model_id,
-        max_tokens: agent.max_tokens,
-        temperature: Number(agent.temperature),
-        system: agent.system_prompt,
-        messages: [{ role: 'user', content: JSON.stringify(input) }]
-      })
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      const upstreamMessage = String(payload?.error?.message || '').replace(/\s+/g, ' ').trim();
-      const detail = upstreamMessage ? `: ${upstreamMessage.slice(0, 500)}` : '';
-      throw providerError('MODEL_PROVIDER_FAILED', `Model provider returned ${response.status}${detail}`);
-    }
-    const text = payload?.content?.find((item) => item.type === 'text')?.text;
-    if (!text) throw providerError('MODEL_OUTPUT_INVALID', 'Model provider did not return text output');
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw providerError('MODEL_OUTPUT_INVALID', 'Model output was not valid JSON');
-    }
-  } catch (error) {
-    if (error.name === 'AbortError') throw providerError('MODEL_TIMEOUT', 'Model call timed out');
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+    return JSON.parse(response.text);
+  } catch {
+    throw providerError('MODEL_OUTPUT_INVALID', 'Model output was not valid JSON');
   }
 }
 
 async function invokeClassificationModel(config, agent, input, modelClient) {
-  try {
-    return await invokeAnthropic(config, agent, input, modelClient);
-  } catch (error) {
-    if (error.code !== 'MODEL_PROVIDER_FAILED') throw error;
-    console.warn('SANDBOX PROVIDER ACTIVE — not for production use');
-    return invokeGroq(config, agent, input);
-  }
+  return invokeAnthropic(config, agent, input, modelClient);
 }
 
 async function activeControlListVersion(client) {
@@ -215,9 +184,10 @@ async function stageTwoCandidates(client, { versionId, extraction, productDescri
             ) AS parameters
        FROM eccn_entries e
        LEFT JOIN eccn_parameters p
-         ON p.version_id = e.version_id AND p.eccn = e.eccn
+         ON p.version_id = e.version_id AND p.eccn = e.eccn AND p.status = 'ACTIVE'
       WHERE e.version_id = $1
-        AND e.is_current = TRUE
+         AND e.is_current = TRUE
+         AND e.status = 'ACTIVE'
         AND ($2::smallint IS NULL OR e.category = $2)
         AND ($3::char(1) IS NULL OR e.product_group = $3)
         AND NOT EXISTS (
@@ -232,6 +202,7 @@ async function stageTwoCandidates(client, { versionId, extraction, productDescri
              )
            WHERE candidate_parameter.version_id = e.version_id
              AND candidate_parameter.eccn = e.eccn
+              AND candidate_parameter.status = 'ACTIVE'
              AND NOT (
                (candidate_parameter.operator = 'GT' AND input_parameter.value > candidate_parameter.threshold_value)
                OR (candidate_parameter.operator = 'GTE' AND input_parameter.value >= candidate_parameter.threshold_value)
@@ -573,6 +544,26 @@ function createClassificationService({ pool, config, modelClient }) {
           citedEntry: reasoning.cited,
           requiresRevalidation: currentVersion.id !== activeVersion.id
         });
+        // UAE National Control List — secondary enrichment in same transaction
+        try {
+          const uaeResult = await screenAgainstUaeList(pool, {
+            productName: product.name,
+            scientificName: null,
+            casNumber: product.cas_number || null,
+            hsCode: product.hs_code || null
+          });
+          await client.query(
+            `UPDATE classification_results
+                SET uae_control_status   = $2,
+                    uae_matched_entry_id = $3,
+                    uae_match_score      = $4
+              WHERE id = $1`,
+            [resultId, uaeResult.status, uaeResult.matchedEntryId, uaeResult.matchScore]
+          );
+        } catch {
+          // UAE screening failure must not block the EAR/ECCN result
+        }
+
         await client.query(`UPDATE classification_jobs SET status = 'COMPLETED', completed_at = now() WHERE id = $1`, [job.id]);
         await writeAudit(client, {
           tenantId: job.tenant_id, caseId: job.case_id, eventType: 'CLASSIFICATION_COMPLETED',
@@ -673,6 +664,8 @@ module.exports = {
   TERMINAL_STATUSES,
   createClassificationService,
   createClassificationWorker,
+  invokeAnthropic,
+  invokeClassificationModel,
   normaliseExtraction,
   normaliseReasoning,
   productFingerprint,
