@@ -606,6 +606,7 @@ function createClassificationService({ pool, config, modelClient }) {
               cr.requires_revalidation, cr.requires_human_review, cr.cached,
               cr.agent_version_id, av.agent_code, av.version_label,
               cr.control_list_version_id, clv.version_label AS control_list_version,
+              cr.uae_control_status, cr.uae_matched_entry_id, cr.uae_match_score,
               job.id AS job_id, job.status AS job_status, job.error_code
          FROM case_products cp
          JOIN products p ON p.id = cp.product_id AND p.tenant_id = cp.tenant_id
